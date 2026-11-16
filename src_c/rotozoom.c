@@ -32,6 +32,48 @@ typedef struct tColorRGBA {
 #define M_PI 3.141592654
 #endif
 
+/* Multiply the three color bytes of a pixel by its alpha byte, so that fully
+ * transparent pixels don't leak their (hidden) RGB values into neighbouring
+ * pixels during bilinear interpolation. `alpha_off` is the byte offset of the
+ * alpha channel within the 32-bit pixel. */
+static void
+premultiply_rgba(tColorRGBA *c, int alpha_off)
+{
+    Uint8 *p = (Uint8 *)c;
+    Uint8 a = p[alpha_off];
+    int i;
+
+    for (i = 0; i < 4; i++) {
+        if (i != alpha_off) {
+            p[i] = (Uint8)(((Uint16)p[i] * a + 127) / 255);
+        }
+    }
+}
+
+/* Reverse the premultiplication done by premultiply_rgba(). */
+static void
+unpremultiply_rgba(tColorRGBA *c, int alpha_off)
+{
+    Uint8 *p = (Uint8 *)c;
+    Uint8 a = p[alpha_off];
+    int i;
+
+    if (a == 0) {
+        for (i = 0; i < 4; i++) {
+            if (i != alpha_off) {
+                p[i] = 0;
+            }
+        }
+    }
+    else if (a != 255) {
+        for (i = 0; i < 4; i++) {
+            if (i != alpha_off) {
+                p[i] = (Uint8)(((Uint16)p[i] * 255 + a / 2) / a);
+            }
+        }
+    }
+}
+
 /*
 
  32bit Zoomer with optional anti-aliasing by bilinear interpolation.
@@ -47,6 +89,16 @@ zoomSurfaceRGBA(SDL_Surface *src, SDL_Surface *dst, int smooth)
     tColorRGBA *c00, *c01, *c10, *c11;
     tColorRGBA *sp, *csp, *dp;
     int dgap;
+    int src_has_alpha = 0;
+    int alpha_off = 0;
+
+    {
+        PG_PixelFormat *src_format = PG_GetSurfaceFormat(src);
+        if (src_format != NULL && src_format->Amask != 0) {
+            src_has_alpha = 1;
+            alpha_off = src_format->Ashift / 8;
+        }
+    }
 
     /*
      * Variable setup
@@ -128,23 +180,41 @@ zoomSurfaceRGBA(SDL_Surface *src, SDL_Surface *dst, int smooth)
             c11++;
             csax = sax;
             for (x = 0; x < dst->w; x++) {
+                tColorRGBA pc00, pc01, pc10, pc11;
+
                 /*
                  * Interpolate colors
                  */
                 ex = (*csax & 0xffff);
                 ey = (*csay & 0xffff);
-                t1 = ((((c01->r - c00->r) * ex) >> 16) + c00->r) & 0xff;
-                t2 = ((((c11->r - c10->r) * ex) >> 16) + c10->r) & 0xff;
+
+                pc00 = *c00;
+                pc01 = *c01;
+                pc10 = *c10;
+                pc11 = *c11;
+                if (src_has_alpha) {
+                    premultiply_rgba(&pc00, alpha_off);
+                    premultiply_rgba(&pc01, alpha_off);
+                    premultiply_rgba(&pc10, alpha_off);
+                    premultiply_rgba(&pc11, alpha_off);
+                }
+
+                t1 = ((((pc01.r - pc00.r) * ex) >> 16) + pc00.r) & 0xff;
+                t2 = ((((pc11.r - pc10.r) * ex) >> 16) + pc10.r) & 0xff;
                 dp->r = (((t2 - t1) * ey) >> 16) + t1;
-                t1 = ((((c01->g - c00->g) * ex) >> 16) + c00->g) & 0xff;
-                t2 = ((((c11->g - c10->g) * ex) >> 16) + c10->g) & 0xff;
+                t1 = ((((pc01.g - pc00.g) * ex) >> 16) + pc00.g) & 0xff;
+                t2 = ((((pc11.g - pc10.g) * ex) >> 16) + pc10.g) & 0xff;
                 dp->g = (((t2 - t1) * ey) >> 16) + t1;
-                t1 = ((((c01->b - c00->b) * ex) >> 16) + c00->b) & 0xff;
-                t2 = ((((c11->b - c10->b) * ex) >> 16) + c10->b) & 0xff;
+                t1 = ((((pc01.b - pc00.b) * ex) >> 16) + pc00.b) & 0xff;
+                t2 = ((((pc11.b - pc10.b) * ex) >> 16) + pc10.b) & 0xff;
                 dp->b = (((t2 - t1) * ey) >> 16) + t1;
-                t1 = ((((c01->a - c00->a) * ex) >> 16) + c00->a) & 0xff;
-                t2 = ((((c11->a - c10->a) * ex) >> 16) + c10->a) & 0xff;
+                t1 = ((((pc01.a - pc00.a) * ex) >> 16) + pc00.a) & 0xff;
+                t2 = ((((pc11.a - pc10.a) * ex) >> 16) + pc10.a) & 0xff;
                 dp->a = (((t2 - t1) * ey) >> 16) + t1;
+
+                if (src_has_alpha) {
+                    unpremultiply_rgba(dp, alpha_off);
+                }
 
                 /*
                  * Advance source pointers
@@ -232,6 +302,16 @@ transformSurfaceRGBA(SDL_Surface *src, SDL_Surface *dst, int cx, int cy,
     tColorRGBA c00, c01, c10, c11;
     tColorRGBA *pc, *sp;
     int gap;
+    int src_has_alpha = 0;
+    int alpha_off = 0;
+
+    {
+        PG_PixelFormat *src_format = PG_GetSurfaceFormat(src);
+        if (src_format != NULL && src_format->Amask != 0) {
+            src_has_alpha = 1;
+            alpha_off = src_format->Ashift / 8;
+        }
+    }
 
     /*
      * Variable setup
@@ -357,6 +437,14 @@ transformSurfaceRGBA(SDL_Surface *src, SDL_Surface *dst, int cx, int cy,
                      */
                     ex = (sdx & 0xffff);
                     ey = (sdy & 0xffff);
+
+                    if (src_has_alpha) {
+                        premultiply_rgba(&c00, alpha_off);
+                        premultiply_rgba(&c01, alpha_off);
+                        premultiply_rgba(&c10, alpha_off);
+                        premultiply_rgba(&c11, alpha_off);
+                    }
+
                     t1 = ((((c01.r - c00.r) * ex) >> 16) + c00.r) & 0xff;
                     t2 = ((((c11.r - c10.r) * ex) >> 16) + c10.r) & 0xff;
                     pc->r = (((t2 - t1) * ey) >> 16) + t1;
@@ -369,6 +457,10 @@ transformSurfaceRGBA(SDL_Surface *src, SDL_Surface *dst, int cx, int cy,
                     t1 = ((((c01.a - c00.a) * ex) >> 16) + c00.a) & 0xff;
                     t2 = ((((c11.a - c10.a) * ex) >> 16) + c10.a) & 0xff;
                     pc->a = (((t2 - t1) * ey) >> 16) + t1;
+
+                    if (src_has_alpha) {
+                        unpremultiply_rgba(pc, alpha_off);
+                    }
                 }
                 sdx += icos;
                 sdy += isin;

@@ -1960,6 +1960,194 @@ class TransformModuleTest(unittest.TestCase):
             )
             self.assertEqual(smaller_surface.get_size(), (k, 1))
 
+    def test_smoothscale_premultiplied_alpha(self):
+        """Transparent pixels must not contribute RGB while interpolating.
+
+        An opaque red pixel next to a fully transparent blue pixel should stay
+        red as it fades out, never picking up the hidden blue (no purple
+        fringe). The alpha channel itself keeps its usual interpolated values.
+        """
+        # Expanding 2x1 -> 8x1.
+        surf = pygame.Surface((2, 1), pygame.SRCALPHA)
+        surf.set_at((0, 0), (255, 0, 0, 255))
+        surf.set_at((1, 0), (0, 0, 255, 0))
+
+        scaled = pygame.transform.smoothscale(surf, (8, 1))
+        expected = [
+            (255, 0, 0, 255),
+            (255, 0, 0, 223),
+            (255, 0, 0, 191),
+            (255, 0, 0, 159),
+            (255, 0, 0, 127),
+            (255, 0, 0, 95),
+            (255, 0, 0, 63),
+            (255, 0, 0, 31),
+        ]
+        self.assertEqual(
+            [tuple(scaled.get_at((x, 0))) for x in range(8)], expected
+        )
+
+        # Shrinking 8x1 -> 3x1: four opaque red then four transparent blue.
+        surf = pygame.Surface((8, 1), pygame.SRCALPHA)
+        for x in range(4):
+            surf.set_at((x, 0), (255, 0, 0, 255))
+        for x in range(4, 8):
+            surf.set_at((x, 0), (0, 0, 255, 0))
+
+        scaled = pygame.transform.smoothscale(surf, (3, 1))
+        expected = [(255, 0, 0, 254), (255, 0, 0, 127), (0, 0, 0, 0)]
+        self.assertEqual(
+            [tuple(scaled.get_at((x, 0))) for x in range(3)], expected
+        )
+
+        # 2D bilinear case: the hidden blue never leaks into any channel.
+        surf = pygame.Surface((2, 2), pygame.SRCALPHA)
+        surf.set_at((0, 0), (255, 0, 0, 255))
+        surf.set_at((1, 0), (0, 0, 255, 0))
+        surf.set_at((0, 1), (0, 255, 0, 128))
+        surf.set_at((1, 1), (255, 255, 0, 255))
+
+        scaled = pygame.transform.smoothscale(surf, (4, 4))
+        expected = [
+            [
+                (255, 0, 0, 255),
+                (255, 0, 0, 191),
+                (255, 0, 0, 127),
+                (255, 0, 0, 63),
+            ],
+            [
+                (218, 37, 0, 223),
+                (222, 54, 0, 183),
+                (226, 84, 0, 143),
+                (235, 136, 0, 103),
+            ],
+            [
+                (170, 85, 0, 191),
+                (185, 115, 0, 175),
+                (204, 152, 0, 159),
+                (226, 198, 0, 143),
+            ],
+            [
+                (101, 154, 0, 159),
+                (145, 182, 0, 167),
+                (185, 208, 0, 175),
+                (222, 233, 0, 183),
+            ],
+        ]
+        self.assertEqual(
+            [[tuple(scaled.get_at((x, y))) for x in range(4)] for y in range(4)],
+            expected,
+        )
+
+    def test_smoothscale_by_premultiplied_alpha(self):
+        """smoothscale_by samples per-pixel alpha with the same semantics."""
+        surf = pygame.Surface((2, 1), pygame.SRCALPHA)
+        surf.set_at((0, 0), (255, 0, 0, 255))
+        surf.set_at((1, 0), (0, 0, 255, 0))
+
+        scaled = pygame.transform.smoothscale_by(surf, (2, 1))
+        expected = [
+            (255, 0, 0, 255),
+            (255, 0, 0, 191),
+            (255, 0, 0, 127),
+            (255, 0, 0, 63),
+        ]
+        self.assertEqual(
+            [tuple(scaled.get_at((x, 0))) for x in range(4)], expected
+        )
+
+    def test_smoothscale_opaque_sources_unchanged(self):
+        """24-bit and 32-bit-no-alpha sources keep classic interpolation."""
+        # 24-bit black -> white expansion.
+        surf = pygame.Surface((2, 1), depth=24)
+        surf.set_at((0, 0), (0, 0, 0))
+        surf.set_at((1, 0), (255, 255, 255))
+        scaled = pygame.transform.smoothscale(surf, (4, 1))
+        expected = [
+            (0, 0, 0, 255),
+            (63, 63, 63, 255),
+            (127, 127, 127, 255),
+            (191, 191, 191, 255),
+        ]
+        self.assertEqual(
+            [tuple(scaled.get_at((x, 0))) for x in range(4)], expected
+        )
+
+        # 32-bit without an alpha channel gives the identical result.
+        surf = pygame.Surface((2, 1), depth=32)
+        surf.set_at((0, 0), (0, 0, 0))
+        surf.set_at((1, 0), (255, 255, 255))
+        scaled = pygame.transform.smoothscale(surf, (4, 1))
+        self.assertEqual(
+            [tuple(scaled.get_at((x, 0))) for x in range(4)], expected
+        )
+
+    def test_smoothscale_dest_surface_incompatible(self):
+        """Incompatible dest_surfaces raise ValueError and are left untouched."""
+        src = pygame.Surface((4, 4), pygame.SRCALPHA)
+        src.fill((255, 0, 0, 255))
+
+        # Different bit depth (24-bit destination).
+        dest = pygame.Surface((8, 8), depth=24)
+        dest.fill((1, 2, 3))
+        before = [tuple(dest.get_at((x, y))) for y in range(8) for x in range(8)]
+        with self.assertRaises(ValueError):
+            pygame.transform.smoothscale(src, (8, 8), dest)
+        after = [tuple(dest.get_at((x, y))) for y in range(8) for x in range(8)]
+        self.assertEqual(after, before)
+
+        # Different channel layout (ARGB-style masks vs the RGBA source).
+        dest = pygame.Surface(
+            (8, 8), pygame.SRCALPHA, 32, (0xFF000000, 0xFF0000, 0xFF00, 0xFF)
+        )
+        dest.fill((1, 2, 3, 4))
+        before = [tuple(dest.get_at((x, y))) for y in range(8) for x in range(8)]
+        with self.assertRaises(ValueError):
+            pygame.transform.smoothscale(src, (8, 8), dest)
+        after = [tuple(dest.get_at((x, y))) for y in range(8) for x in range(8)]
+        self.assertEqual(after, before)
+
+        # A compatible destination is written in place and returned.
+        dest = pygame.Surface((8, 8), pygame.SRCALPHA)
+        ret = pygame.transform.smoothscale(src, (8, 8), dest)
+        self.assertIs(ret, dest)
+        self.assertEqual(tuple(dest.get_at((0, 0))), (255, 0, 0, 255))
+
+    def test_rotozoom_premultiplied_alpha(self):
+        """rotozoom samples premultiplied alpha when zooming and rotating."""
+        # Pure zoom (angle 0) of an opaque red pixel next to a transparent
+        # blue one: the red edge stays red while fading out.
+        surf = pygame.Surface((2, 1), pygame.SRCALPHA)
+        surf.set_at((0, 0), (255, 0, 0, 255))
+        surf.set_at((1, 0), (0, 0, 255, 0))
+
+        zoomed = pygame.transform.rotozoom(surf, 0, 2)
+        self.assertEqual(zoomed.get_size(), (4, 2))
+        expected = [
+            (255, 0, 0, 255),
+            (255, 0, 0, 191),
+            (255, 0, 0, 127),
+            (255, 0, 0, 63),
+        ]
+        for y in range(2):
+            self.assertEqual(
+                [tuple(zoomed.get_at((x, y))) for x in range(4)], expected
+            )
+
+        # Rotated case: the only blue pixel is fully transparent, so no output
+        # pixel may contain any blue at all.
+        surf = pygame.Surface((2, 2), pygame.SRCALPHA)
+        surf.set_at((0, 0), (255, 0, 0, 255))
+        surf.set_at((1, 0), (0, 0, 255, 0))
+        surf.set_at((0, 1), (0, 255, 0, 255))
+        surf.set_at((1, 1), (255, 255, 0, 255))
+
+        rotated = pygame.transform.rotozoom(surf, 45, 1)
+        self.assertEqual(rotated.get_size(), (4, 4))
+        for y in range(rotated.get_height()):
+            for x in range(rotated.get_width()):
+                self.assertEqual(rotated.get_at((x, y))[2], 0)
+
     def test_pixelate(self):
         """Test pygame.transform.pixelate"""
         # test that pixelating the original with a pixel_size of 1 yields the original back

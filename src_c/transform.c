@@ -1389,12 +1389,74 @@ convert_32_24(Uint8 *srcpix, int srcpitch, Uint8 *dstpix, int dstpitch,
     }
 }
 
+/* Multiply the three color bytes of each pixel by its alpha byte, so that
+ * fully transparent pixels don't leak their (hidden) RGB values into
+ * neighbouring pixels during interpolation. `alpha_off` is the byte offset
+ * of the alpha channel within a 32-bit pixel. */
+static void
+premultiply_alpha(Uint8 *pix, int pitch, int width, int height, int alpha_off)
+{
+    int diff = pitch - width * 4;
+    int x, y;
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++) {
+            Uint8 a = pix[alpha_off];
+            int i;
+
+            if (a != 255) {
+                for (i = 0; i < 4; i++) {
+                    if (i != alpha_off) {
+                        pix[i] = (Uint8)(((Uint16)pix[i] * a + 127) / 255);
+                    }
+                }
+            }
+            pix += 4;
+        }
+        pix += diff;
+    }
+}
+
+/* Reverse the premultiplication done by premultiply_alpha(), dividing the
+ * color bytes back out by the (already interpolated) alpha byte. */
+static void
+unpremultiply_alpha(Uint8 *pix, int pitch, int width, int height, int alpha_off)
+{
+    int diff = pitch - width * 4;
+    int x, y;
+
+    for (y = 0; y < height; y++) {
+        for (x = 0; x < width; x++) {
+            Uint8 a = pix[alpha_off];
+            int i;
+
+            if (a == 0) {
+                for (i = 0; i < 4; i++) {
+                    if (i != alpha_off) {
+                        pix[i] = 0;
+                    }
+                }
+            }
+            else if (a != 255) {
+                for (i = 0; i < 4; i++) {
+                    if (i != alpha_off) {
+                        pix[i] = (Uint8)(((Uint16)pix[i] * 255 + a / 2) / a);
+                    }
+                }
+            }
+            pix += 4;
+        }
+        pix += diff;
+    }
+}
+
 static void
 scalesmooth(SDL_Surface *src, SDL_Surface *dst, struct _module_state *st)
 {
     Uint8 *srcpix = (Uint8 *)src->pixels;
     Uint8 *dstpix = (Uint8 *)dst->pixels;
     Uint8 *dst32 = NULL;
+    Uint8 *premult = NULL;
     int srcpitch = src->pitch;
     int dstpitch = dst->pitch;
 
@@ -1407,12 +1469,34 @@ scalesmooth(SDL_Surface *src, SDL_Surface *dst, struct _module_state *st)
 
     Uint8 *temppix = NULL;
     int tempwidth = 0, temppitch = 0;
+    int alpha_off = 0;
+
+    /* For 32-bit per-pixel-alpha surfaces, premultiply the RGB bytes by the
+     * alpha byte so that transparent pixels contribute no RGB during
+     * interpolation. Opaque sources (24-bit, or 32-bit without an alpha
+     * channel) are left untouched so their output is byte-for-byte identical
+     * to previous behaviour. */
+    if (bpp == 4) {
+        PG_PixelFormat *src_format = PG_GetSurfaceFormat(src);
+        if (src_format != NULL && src_format->Amask != 0) {
+            alpha_off = src_format->Ashift / 8;
+            premult = (Uint8 *)malloc((size_t)srcpitch * srcheight);
+            if (premult == NULL) {
+                return;
+            }
+            memcpy(premult, srcpix, (size_t)srcpitch * srcheight);
+            premultiply_alpha(premult, srcpitch, srcwidth, srcheight,
+                              alpha_off);
+            srcpix = premult;
+        }
+    }
 
     /* convert to 32-bit if necessary */
     if (bpp == 3) {
         int newpitch = srcwidth * 4;
         Uint8 *newsrc = (Uint8 *)malloc((size_t)newpitch * srcheight);
         if (!newsrc) {
+            free(premult);
             return;
         }
         convert_24_32(srcpix, srcpitch, newsrc, newpitch, srcwidth, srcheight);
@@ -1423,6 +1507,7 @@ scalesmooth(SDL_Surface *src, SDL_Surface *dst, struct _module_state *st)
         dst32 = (Uint8 *)malloc((size_t)dstpitch * dstheight);
         if (dst32 == NULL) {
             free(srcpix);
+            free(premult);
             return;
         }
         dstpix = dst32;
@@ -1439,6 +1524,7 @@ scalesmooth(SDL_Surface *src, SDL_Surface *dst, struct _module_state *st)
                 free(srcpix);
                 free(dstpix);
             }
+            free(premult);
             return;
         }
     }
@@ -1490,6 +1576,14 @@ scalesmooth(SDL_Surface *src, SDL_Surface *dst, struct _module_state *st)
         }
     }
 
+    /* Reverse the premultiplication on the destination for per-pixel-alpha
+     * sources, now that the alpha channel has been interpolated. */
+    if (premult != NULL) {
+        unpremultiply_alpha(dstpix, dstpitch, dstwidth, dstheight, alpha_off);
+        free(premult);
+        premult = NULL;
+    }
+
     /* Convert back to 24-bit if necessary */
     if (bpp == 3) {
         convert_32_24(dst32, dstpitch, (Uint8 *)dst->pixels, dst->pitch,
@@ -1534,6 +1628,23 @@ smoothscale_to(PyObject *self, pgSurfaceObject *srcobj,
     }
     else {
         retsurf = pgSurface_AsSurface(dstobj);
+
+        PG_PixelFormat *ret_format = PG_GetSurfaceFormat(retsurf);
+        PG_PixelFormat *src_format = PG_GetSurfaceFormat(src);
+        if (ret_format == NULL || src_format == NULL) {
+            return (SDL_Surface *)(RAISE(pgExc_SDLError, SDL_GetError()));
+        }
+
+        if (PG_FORMAT_BytesPerPixel(ret_format) !=
+                PG_FORMAT_BytesPerPixel(src_format) ||
+            ret_format->Rmask != src_format->Rmask ||
+            ret_format->Gmask != src_format->Gmask ||
+            ret_format->Bmask != src_format->Bmask) {
+            return (SDL_Surface *)(RAISE(
+                PyExc_ValueError,
+                "Source and destination surfaces need to be compatible "
+                "formats."));
+        }
     }
 
     if (retsurf->w != width || retsurf->h != height) {
