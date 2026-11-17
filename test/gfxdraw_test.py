@@ -912,6 +912,42 @@ class GfxdrawDefaultTest(unittest.TestCase):
             except Exception as e:
                 self.fail(f"gfxdraw.{name} raised an exception: {e}")
 
+    def test_alpha_blend_matches_blit(self):
+        """Semi-transparent gfxdraw pixels composite like a solid blit."""
+        bg = (255, 0, 0, 255)
+        color = (0, 0, 255, 128)
+
+        # pixel: full-coverage composite must equal blitting a solid surface.
+        surf = pygame.Surface((4, 4), SRCALPHA, 32)
+        surf.fill(bg)
+        pygame.gfxdraw.pixel(surf, 0, 0, color)
+
+        expected = pygame.Surface((4, 4), SRCALPHA, 32)
+        expected.fill(bg)
+        solid = pygame.Surface((1, 1), SRCALPHA, 32)
+        solid.fill(color)
+        expected.blit(solid, (0, 0))
+
+        self.assertEqual(surf.get_at((0, 0)), expected.get_at((0, 0)))
+
+        # filled rectangle: same for the _filledRectAlpha path.
+        surf.fill(bg)
+        pygame.gfxdraw.box(surf, pygame.Rect(1, 1, 2, 2), color)
+
+        expected.fill(bg)
+        solid = pygame.Surface((2, 2), SRCALPHA, 32)
+        solid.fill(color)
+        expected.blit(solid, (1, 1))
+
+        for pos in ((1, 1), (2, 2)):
+            self.assertEqual(surf.get_at(pos), expected.get_at(pos))
+
+        # Fully transparent target: source is written through verbatim.
+        clear = pygame.Surface((2, 2), SRCALPHA, 32)
+        clear.fill((0, 0, 0, 0))
+        pygame.gfxdraw.pixel(clear, 0, 0, (10, 20, 30, 200))
+        self.assertEqual(clear.get_at((0, 0)), (10, 20, 30, 200))
+
 
 if __name__ == "__main__":
     unittest.main()

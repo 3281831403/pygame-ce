@@ -19,9 +19,6 @@ LGPL (c) A. Schiffler
 
 /* -===================- */
 
-#define DEFAULT_ALPHA_PIXEL_ROUTINE
-#undef EXPERIMENTAL_ALPHA_PIXEL_ROUTINE
-
 /* ---- Structures */
 
 #if 0  /********** CURRENTLY NOT USED BY pygame.gfxdraw **********/
@@ -255,13 +252,48 @@ int fastPixelRGBANolock(SDL_Surface * dst, Sint16 x, Sint16 y, Uint8 r, Uint8 g,
 #endif /********** CURRENTLY NOT USED BY pygame.gfxdraw **********/
 
 /*!
+\brief Blend a source color over a destination color using pygame's blit alpha
+blend equation (see ALPHA_BLEND in surface.h).
+
+Source and destination are given as 8-bit RGBA components. When the destination
+is fully transparent (dA == 0) the source is written through verbatim, matching
+pygame's blit behavior. Otherwise the result is computed the same way a blit of
+a same-colored solid surface would, and written back into the destination
+components.
+
+\param sR The source red component.
+\param sG The source green component.
+\param sB The source blue component.
+\param sA The source alpha component.
+\param dR Destination red component (updated in place).
+\param dG Destination green component (updated in place).
+\param dB Destination blue component (updated in place).
+\param dA Destination alpha component (updated in place).
+*/
+static void
+_gfx_alpha_blend(Uint8 sR, Uint8 sG, Uint8 sB, Uint8 sA, Uint8 *dR, Uint8 *dG,
+                 Uint8 *dB, Uint8 *dA)
+{
+    if (*dA) {
+        *dR = (Uint8)(((*dR << 8) + (sR - *dR) * sA + sR) >> 8);
+        *dG = (Uint8)(((*dG << 8) + (sG - *dG) * sA + sG) >> 8);
+        *dB = (Uint8)(((*dB << 8) + (sB - *dB) * sA + sB) >> 8);
+        *dA = (Uint8)(sA + *dA - (sA * *dA) / 255);
+    }
+    else {
+        *dR = sR;
+        *dG = sG;
+        *dB = sB;
+        *dA = sA;
+    }
+}
+
+/*!
 \brief Internal pixel drawing function with alpha blending where input color in
 in destination format.
 
-Contains two alternative 32 bit alpha blending routines which can be enabled at
-the source level with the defines DEFAULT_ALPHA_PIXEL_ROUTINE or
-EXPERIMENTAL_ALPHA_PIXEL_ROUTINE. Only the bits up to the surface depth are
-significant in the color value.
+Only the bits up to the surface depth are significant in the color value.
+Alpha blending matches pygame's blit alpha blend equation.
 
 \param dst The surface to draw on.
 \param x The horizontal coordinate of the pixel.
@@ -275,9 +307,6 @@ int
 _putPixelAlpha(SDL_Surface *dst, Sint16 x, Sint16 y, Uint32 color, Uint8 alpha)
 {
     SDL_PixelFormat *format;
-    Uint32 Rmask, Gmask, Bmask, Amask;
-    Uint32 Rshift, Gshift, Bshift, Ashift;
-    Uint32 R, G, B, A;
 
     if (dst == NULL) {
         return (-1);
@@ -310,34 +339,18 @@ _putPixelAlpha(SDL_Surface *dst, Sint16 x, Sint16 y, Uint32 color, Uint8 alpha)
             } break;
 
             case 2: { /* Probably 15-bpp or 16-bpp */
+                Uint16 *pixel =
+                    (Uint16 *)dst->pixels + y * dst->pitch / 2 + x;
                 if (alpha == 255) {
-                    *((Uint16 *)dst->pixels + y * dst->pitch / 2 + x) = color;
+                    *pixel = (Uint16)color;
                 }
                 else {
-                    Uint16 *pixel =
-                        (Uint16 *)dst->pixels + y * dst->pitch / 2 + x;
-                    Uint32 dc = *pixel;
+                    Uint8 sR, sG, sB, dR, dG, dB, dA;
 
-                    Rmask = format->Rmask;
-                    Gmask = format->Gmask;
-                    Bmask = format->Bmask;
-                    Amask = format->Amask;
-                    R = ((dc & Rmask) +
-                         (((color & Rmask) - (dc & Rmask)) * alpha >> 8)) &
-                        Rmask;
-                    G = ((dc & Gmask) +
-                         (((color & Gmask) - (dc & Gmask)) * alpha >> 8)) &
-                        Gmask;
-                    B = ((dc & Bmask) +
-                         (((color & Bmask) - (dc & Bmask)) * alpha >> 8)) &
-                        Bmask;
-                    *pixel = R | G | B;
-                    if (Amask != 0) {
-                        A = ((dc & Amask) +
-                             (((color & Amask) - (dc & Amask)) * alpha >> 8)) &
-                            Amask;
-                        *pixel |= A;
-                    }
+                    SDL_GetRGB(color, format, &sR, &sG, &sB);
+                    SDL_GetRGBA(*pixel, format, &dR, &dG, &dB, &dA);
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR, &dG, &dB, &dA);
+                    *pixel = (Uint16)SDL_MapRGBA(format, dR, dG, dB, dA);
                 }
             } break;
 
@@ -366,123 +379,30 @@ _putPixelAlpha(SDL_Surface *dst, Sint16 x, Sint16 y, Uint32 color, Uint8 alpha)
                     *dB = sB;
                 }
                 else {
-                    *dR = *dR + ((sR - *dR) * alpha >> 8);
-                    *dG = *dG + ((sG - *dG) * alpha >> 8);
-                    *dB = *dB + ((sB - *dB) * alpha >> 8);
+                    Uint8 dR2 = *dR, dG2 = *dG, dB2 = *dB, dA = 255;
+
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR2, &dG2, &dB2, &dA);
+                    *dR = dR2;
+                    *dG = dG2;
+                    *dB = dB2;
                 }
             } break;
-
-#ifdef DEFAULT_ALPHA_PIXEL_ROUTINE
 
             case 4: { /* Probably :-) 32-bpp */
+                Uint32 *pixel =
+                    (Uint32 *)dst->pixels + y * dst->pitch / 4 + x;
                 if (alpha == 255) {
-                    *((Uint32 *)dst->pixels + y * dst->pitch / 4 + x) = color;
+                    *pixel = color;
                 }
                 else {
-                    Uint32 *pixel =
-                        (Uint32 *)dst->pixels + y * dst->pitch / 4 + x;
-                    Uint32 dc = *pixel;
+                    Uint8 sR, sG, sB, dR, dG, dB, dA;
 
-                    Rmask = format->Rmask;
-                    Gmask = format->Gmask;
-                    Bmask = format->Bmask;
-                    Amask = format->Amask;
-
-                    Rshift = format->Rshift;
-                    Gshift = format->Gshift;
-                    Bshift = format->Bshift;
-                    Ashift = format->Ashift;
-
-                    R = ((dc & Rmask) +
-                         (((((color & Rmask) - (dc & Rmask)) >> Rshift) *
-                               alpha >>
-                           8)
-                          << Rshift)) &
-                        Rmask;
-                    G = ((dc & Gmask) +
-                         (((((color & Gmask) - (dc & Gmask)) >> Gshift) *
-                               alpha >>
-                           8)
-                          << Gshift)) &
-                        Gmask;
-                    B = ((dc & Bmask) +
-                         (((((color & Bmask) - (dc & Bmask)) >> Bshift) *
-                               alpha >>
-                           8)
-                          << Bshift)) &
-                        Bmask;
-                    *pixel = R | G | B;
-                    if (Amask != 0) {
-                        A = ((dc & Amask) +
-                             (((((color & Amask) - (dc & Amask)) >> Ashift) *
-                                   alpha >>
-                               8)
-                              << Ashift)) &
-                            Amask;
-                        *pixel |= A;
-                    }
+                    SDL_GetRGB(color, format, &sR, &sG, &sB);
+                    SDL_GetRGBA(*pixel, format, &dR, &dG, &dB, &dA);
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR, &dG, &dB, &dA);
+                    *pixel = SDL_MapRGBA(format, dR, dG, dB, dA);
                 }
             } break;
-#endif
-
-#ifdef EXPERIMENTAL_ALPHA_PIXEL_ROUTINE
-
-            case 4: { /* Probably :-) 32-bpp */
-                if (alpha == 255) {
-                    *((Uint32 *)dst->pixels + y * dst->pitch / 4 + x) = color;
-                }
-                else {
-                    Uint32 *pixel =
-                        (Uint32 *)dst->pixels + y * dst->pitch / 4 + x;
-                    Uint32 dR, dG, dB, dA;
-                    Uint32 dc = *pixel;
-
-                    Uint32 surfaceAlpha, preMultR, preMultG, preMultB;
-                    Uint32 aTmp;
-
-                    Rmask = format->Rmask;
-                    Gmask = format->Gmask;
-                    Bmask = format->Bmask;
-                    Amask = format->Amask;
-
-                    dR = (color & Rmask);
-                    dG = (color & Gmask);
-                    dB = (color & Bmask);
-                    dA = (color & Amask);
-
-                    Rshift = format->Rshift;
-                    Gshift = format->Gshift;
-                    Bshift = format->Bshift;
-                    Ashift = format->Ashift;
-
-                    preMultR = (alpha * (dR >> Rshift));
-                    preMultG = (alpha * (dG >> Gshift));
-                    preMultB = (alpha * (dB >> Bshift));
-
-                    surfaceAlpha = ((dc & Amask) >> Ashift);
-                    aTmp = (255 - alpha);
-                    if (A = 255 - ((aTmp * (255 - surfaceAlpha)) >> 8)) {
-                        aTmp *= surfaceAlpha;
-                        R = (preMultR +
-                             ((aTmp * ((dc & Rmask) >> Rshift)) >> 8)) /
-                                    A
-                                << Rshift &
-                            Rmask;
-                        G = (preMultG +
-                             ((aTmp * ((dc & Gmask) >> Gshift)) >> 8)) /
-                                    A
-                                << Gshift &
-                            Gmask;
-                        B = (preMultB +
-                             ((aTmp * ((dc & Bmask) >> Bshift)) >> 8)) /
-                                    A
-                                << Bshift &
-                            Bmask;
-                    }
-                    *pixel = R | G | B | (A << Ashift & Amask);
-                }
-            } break;
-#endif
         }
     }
 
@@ -591,10 +511,7 @@ _filledRectAlpha(SDL_Surface *dst, Sint16 x1, Sint16 y1, Sint16 x2, Sint16 y2,
                  Uint32 color, Uint8 alpha)
 {
     SDL_PixelFormat *format;
-    Uint32 Rmask, Bmask, Gmask, Amask;
-    Uint32 Rshift, Bshift, Gshift, Ashift;
-    Uint8 sR, sG, sB, sA;
-    Uint32 R, G, B, A;
+    Uint8 sR, sG, sB;
     Sint16 x, y;
 
     format = dst->format;
@@ -623,38 +540,18 @@ _filledRectAlpha(SDL_Surface *dst, Sint16 x1, Sint16 y1, Sint16 x2, Sint16 y2,
 
         case 2: { /* Probably 15-bpp or 16-bpp */
             Uint16 *row, *pixel;
-            Uint32 dR, dG, dB, dA;
-            Rmask = format->Rmask;
-            Gmask = format->Gmask;
-            Bmask = format->Bmask;
-            Amask = format->Amask;
+            Uint8 dR, dG, dB, dA;
 
-            dR = (color & Rmask);
-            dG = (color & Gmask);
-            dB = (color & Bmask);
-            dA = (color & Amask);
+            SDL_GetRGB(color, format, &sR, &sG, &sB);
 
             for (y = y1; y <= y2; y++) {
                 row = (Uint16 *)dst->pixels + y * dst->pitch / 2;
                 for (x = x1; x <= x2; x++) {
                     pixel = row + x;
 
-                    R = ((*pixel & Rmask) +
-                         ((dR - (*pixel & Rmask)) * alpha >> 8)) &
-                        Rmask;
-                    G = ((*pixel & Gmask) +
-                         ((dG - (*pixel & Gmask)) * alpha >> 8)) &
-                        Gmask;
-                    B = ((*pixel & Bmask) +
-                         ((dB - (*pixel & Bmask)) * alpha >> 8)) &
-                        Bmask;
-                    *pixel = R | G | B;
-                    if (Amask != 0) {
-                        A = ((*pixel & Amask) +
-                             ((dA - (*pixel & Amask)) * alpha >> 8)) &
-                            Amask;
-                        *pixel |= A;
-                    }
+                    SDL_GetRGBA(*pixel, format, &dR, &dG, &dB, &dA);
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR, &dG, &dB, &dA);
+                    *pixel = (Uint16)SDL_MapRGBA(format, dR, dG, dB, dA);
                 }
             }
         } break;
@@ -663,8 +560,8 @@ _filledRectAlpha(SDL_Surface *dst, Sint16 x1, Sint16 y1, Sint16 x2, Sint16 y2,
             /* Slow 24-bpp mode. This is patched on the pygame end because the
              * original code failed on big endian */
             Uint8 *row, *pix;
-            Uint8 *dR, *dG, *dB;
-            Uint8 sR, sG, sB;
+            Uint8 *dRp, *dGp, *dBp;
+            Uint8 dR, dG, dB, dA;
 
             SDL_GetRGB(color, format, &sR, &sG, &sB);
             for (y = y1; y <= y2; y++) {
@@ -673,131 +570,44 @@ _filledRectAlpha(SDL_Surface *dst, Sint16 x1, Sint16 y1, Sint16 x2, Sint16 y2,
                     pix = row + x * 3;
 
 #if (SDL_BYTEORDER == SDL_LIL_ENDIAN)
-                    dR = pix + (format->Rshift >> 3);
-                    dG = pix + (format->Gshift >> 3);
-                    dB = pix + (format->Bshift >> 3);
+                    dRp = pix + (format->Rshift >> 3);
+                    dGp = pix + (format->Gshift >> 3);
+                    dBp = pix + (format->Bshift >> 3);
 #else
-                    dR = pix + 2 - (format->Rshift >> 3);
-                    dG = pix + 2 - (format->Gshift >> 3);
-                    dB = pix + 2 - (format->Bshift >> 3);
+                    dRp = pix + 2 - (format->Rshift >> 3);
+                    dGp = pix + 2 - (format->Gshift >> 3);
+                    dBp = pix + 2 - (format->Bshift >> 3);
 #endif
 
-                    *dR = *dR + ((sR - *dR) * alpha >> 8);
-                    *dG = *dG + ((sG - *dG) * alpha >> 8);
-                    *dB = *dB + ((sB - *dB) * alpha >> 8);
+                    dR = *dRp;
+                    dG = *dGp;
+                    dB = *dBp;
+                    dA = 255;
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR, &dG, &dB, &dA);
+                    *dRp = dR;
+                    *dGp = dG;
+                    *dBp = dB;
                 }
             }
         } break;
 
-#ifdef DEFAULT_ALPHA_PIXEL_ROUTINE
         case 4: { /* Probably :-) 32-bpp */
             Uint32 *row, *pixel;
-            Uint32 dR, dG, dB, dA;
+            Uint8 dR, dG, dB, dA;
 
-            Rmask = format->Rmask;
-            Gmask = format->Gmask;
-            Bmask = format->Bmask;
-            Amask = format->Amask;
-
-            Rshift = format->Rshift;
-            Gshift = format->Gshift;
-            Bshift = format->Bshift;
-            Ashift = format->Ashift;
-
-            dR = (color & Rmask);
-            dG = (color & Gmask);
-            dB = (color & Bmask);
-            dA = (color & Amask);
+            SDL_GetRGB(color, format, &sR, &sG, &sB);
 
             for (y = y1; y <= y2; y++) {
                 row = (Uint32 *)dst->pixels + y * dst->pitch / 4;
                 for (x = x1; x <= x2; x++) {
                     pixel = row + x;
 
-                    R = ((*pixel & Rmask) +
-                         ((((dR - (*pixel & Rmask)) >> Rshift) * alpha >> 8)
-                          << Rshift)) &
-                        Rmask;
-                    G = ((*pixel & Gmask) +
-                         ((((dG - (*pixel & Gmask)) >> Gshift) * alpha >> 8)
-                          << Gshift)) &
-                        Gmask;
-                    B = ((*pixel & Bmask) +
-                         ((((dB - (*pixel & Bmask)) >> Bshift) * alpha >> 8)
-                          << Bshift)) &
-                        Bmask;
-                    *pixel = R | G | B;
-                    if (Amask != 0) {
-                        A = ((*pixel & Amask) +
-                             ((((dA - (*pixel & Amask)) >> Ashift) * alpha >>
-                               8)
-                              << Ashift)) &
-                            Amask;
-                        *pixel |= A;
-                    }
+                    SDL_GetRGBA(*pixel, format, &dR, &dG, &dB, &dA);
+                    _gfx_alpha_blend(sR, sG, sB, alpha, &dR, &dG, &dB, &dA);
+                    *pixel = SDL_MapRGBA(format, dR, dG, dB, dA);
                 }
             }
         } break;
-#endif
-
-#ifdef EXPERIMENTAL_ALPHA_PIXEL_ROUTINE
-        case 4: { /* Probably :-) 32-bpp */
-            Uint32 *row, *pixel;
-            Uint32 dR, dG, dB, dA;
-            Uint32 dc;
-            Uint32 surfaceAlpha, preMultR, preMultG, preMultB;
-            Uint32 aTmp;
-
-            Rmask = format->Rmask;
-            Gmask = format->Gmask;
-            Bmask = format->Bmask;
-            Amask = format->Amask;
-
-            dR = (color & Rmask);
-            dG = (color & Gmask);
-            dB = (color & Bmask);
-            dA = (color & Amask);
-
-            Rshift = format->Rshift;
-            Gshift = format->Gshift;
-            Bshift = format->Bshift;
-            Ashift = format->Ashift;
-
-            preMultR = (alpha * (dR >> Rshift));
-            preMultG = (alpha * (dG >> Gshift));
-            preMultB = (alpha * (dB >> Bshift));
-
-            for (y = y1; y <= y2; y++) {
-                row = (Uint32 *)dst->pixels + y * dst->pitch / 4;
-                for (x = x1; x <= x2; x++) {
-                    pixel = row + x;
-                    dc = *pixel;
-
-                    surfaceAlpha = ((dc & Amask) >> Ashift);
-                    aTmp = (255 - alpha);
-                    if (A = 255 - ((aTmp * (255 - surfaceAlpha)) >> 8)) {
-                        aTmp *= surfaceAlpha;
-                        R = (preMultR +
-                             ((aTmp * ((dc & Rmask) >> Rshift)) >> 8)) /
-                                    A
-                                << Rshift &
-                            Rmask;
-                        G = (preMultG +
-                             ((aTmp * ((dc & Gmask) >> Gshift)) >> 8)) /
-                                    A
-                                << Gshift &
-                            Gmask;
-                        B = (preMultB +
-                             ((aTmp * ((dc & Bmask) >> Bshift)) >> 8)) /
-                                    A
-                                << Bshift &
-                            Bmask;
-                    }
-                    *pixel = R | G | B | (A << Ashift & Amask);
-                }
-            }
-        } break;
-#endif
     }
 
     return (0);
